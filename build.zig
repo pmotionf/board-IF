@@ -28,7 +28,7 @@ pub fn build(b: *std.Build) !void {
 
     trans_soem.linkLibrary(soem.artifact("soem"));
 
-    const mod = b.addModule("board_IF", .{
+    const mod = b.addModule("board-IF", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
     });
@@ -41,12 +41,4 @@ pub fn build(b: *std.Build) !void {
     const run_mod_tests = b.addRunArtifact(mod_tests);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
-
-    // const exe_tests = b.addTest(.{
-    //     .root_module = exe.root_module,
-    // });
-
-    // const run_exe_tests = b.addRunArtifact(exe_tests);
-
-    // test_step.dependOn(&run_exe_tests.step);
 }
