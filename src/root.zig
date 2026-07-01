@@ -1,6 +1,6 @@
 //! By convention, root.zig is the root source file when making a package.
 const std = @import("std");
-const soem = @import("soem");
+pub const soem = @import("soem");
 
 // Functionality that we want for the board
 // - Initialize the connection, including connect
