@@ -37,6 +37,14 @@ pub fn process(ctx: *soem.ecx_contextt, ifname: []const u8) !void {
     if (size > max_stations) return error.StationNumberOverflow;
     _ = soem.ecx_configdc(ctx);
     // Wait until all slaves are in SAFE_OP state.
+    while (true) {
+        const code = soem.ecx_readstate(ctx);
+        if (code > std.math.maxInt(@typeInfo(SlaveState).@"enum".tag_type)) {
+            return error.InvalidReadState;
+        }
+        if (@as(SlaveState, @enumFromInt(soem.ecx_readstate(ctx))) ==
+            SlaveState.EC_STATE_SAFE_OP) break;
+    }
     while (@as(
         SlaveState,
         @enumFromInt(soem.ecx_readstate(ctx)),
@@ -126,7 +134,7 @@ const ErrorCode = enum(u8) {
     }
 };
 
-const SlaveState = enum(u16) {
+const SlaveState = enum(u5) {
     /// No valid state.
     EC_STATE_NONE = 0x00,
     /// Init state
@@ -139,4 +147,6 @@ const SlaveState = enum(u16) {
     EC_STATE_SAFE_OP = 0x04,
     /// Operational
     EC_STATE_OPERATIONAL = 0x08,
+    // Error or ACK Error
+    EC_STATE_ACK_ERROR = 0x10,
 };
