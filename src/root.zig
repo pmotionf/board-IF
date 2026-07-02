@@ -9,23 +9,23 @@ pub const soem = @import("soem");
 // - Close the connection
 // - Error handling
 
-pub const IoMap = []const u8;
+pub const IoMap = []u8;
 
 pub const ProcessData = extern struct {
     output: Output,
     input: Input,
 
     pub const Output = extern struct {
-        slaves: []Slave,
-        pub const Slave = struct {
+        slaves: [*c]Slave,
+        pub const Slave = extern struct {
             y: [8]u8,
             ww: [16]u16,
         };
     };
 
     pub const Input = extern struct {
-        slaves: []Slave,
-        pub const Slave = struct {
+        slaves: [*c]Slave,
+        pub const Slave = extern struct {
             x: [8]u8,
             wr: [16]u16,
             status: u16,
@@ -34,24 +34,6 @@ pub const ProcessData = extern struct {
     };
 
     pub const size = @bitSizeOf(Input.Slave) + @bitSizeOf(Output.Slave);
-
-    pub fn init(
-        gpa: std.mem.Allocator,
-        slave_count: u16,
-    ) std.mem.Allocator.Error!ProcessData {
-        var res: ProcessData = undefined;
-        res.input.slaves = try gpa.alloc(Input.Slave, slave_count);
-        res.output.slaves = try gpa.alloc(Output.Slave, slave_count);
-    }
-
-    pub fn deinit(self: ProcessData, gpa: std.mem.Allocator) void {
-        gpa.free(self.input.slaves);
-        gpa.free(self.output.slaves);
-    }
-
-    pub fn map(self: *ProcessData, io_map: IoMap) void {
-        self = @ptrCast(io_map);
-    }
 };
 
 /// Initialize the ethercat connection to slaves. After calling this function,
@@ -65,13 +47,17 @@ pub fn init(
 ) !IoMap {
     try error_handling(ctx, soem.ecx_init(ctx, @ptrCast(ifname)));
     errdefer soem.ecx_close(ctx);
-    const stations = soem.ecx_config_init(ctx);
+    const stations: usize = @intCast(soem.ecx_config_init(ctx));
     if (stations <= 0) {
         return error.NoSlavesFound;
     }
     const io_map = try gpa.alloc(u8, stations * ProcessData.size);
     errdefer gpa.free(io_map);
-    const size = soem.ecx_config_map_group(ctx, &io_map, 0);
+    const size = soem.ecx_config_map_group(
+        ctx,
+        @ptrCast(@alignCast(io_map)),
+        0,
+    );
     const expected_WKC =
         ctx.grouplist[0].outputsWKC * 2 + ctx.grouplist[0].inputsWKC;
     if (size > io_map.len) return error.IoMapOverflow;
