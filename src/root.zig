@@ -25,12 +25,13 @@ pub const ProcessData = extern struct {
     },
 };
 
-/// Initialize the ethercat connection to slaves and maintain its operational
-/// state. This function is intended to be called by Zig Group/Select interface
-/// to support cancelation. To close the connection, cancel the thread.
-pub fn process(ctx: *soem.ecx_contextt, ifname: []const u8) !void {
+/// Initialize the ethercat connection to slaves. After calling this function,
+/// user must keep `process()` alive on other thread. Failing to keep
+/// `process()` alive may terminate the connection. Caller also must call
+/// deinit upon finishing with the connection.
+pub fn init(ctx: *soem.ecx_contextt, ifname: []const u8) !void {
     try error_handling(ctx, soem.ecx_init(ctx, @ptrCast(ifname)));
-    defer soem.ecx_close(ctx);
+    errdefer soem.ecx_close(ctx);
     const size = soem.ecx_config_map_group(ctx, &io_map, 0);
     const expected_WKC =
         ctx.grouplist[0].outputsWKC * 2 + ctx.grouplist[0].inputsWKC;
@@ -69,7 +70,19 @@ pub fn process(ctx: *soem.ecx_contextt, ifname: []const u8) !void {
             return error.InvalidWorkCounter;
         }
     }
+}
+
+/// Maintain the connection to the slaves.
+pub fn process(io: std.Io, ctx: *soem.ecx_contextt) !void {
+    defer {
+        if (@errorReturnTrace()) |error_trace| {
+            std.debug.dumpErrorReturnTrace(error_trace);
+        }
+    }
+    const expected_WKC =
+        ctx.grouplist[0].outputsWKC * 2 + ctx.grouplist[0].inputsWKC;
     while (true) {
+        try io.checkCancel();
         if (soem.ecx_send_processdata(ctx) != expected_WKC and
             soem.ecx_receive_processdata(ctx, soem.EC_TIMEOUTRET) != expected_WKC)
         {
@@ -78,17 +91,10 @@ pub fn process(ctx: *soem.ecx_contextt, ifname: []const u8) !void {
     }
 }
 
-/// Wait until all slaves state enter the requested state
-fn waitState(
-    ctx: *soem.ecx_contextt,
-    req_state: SlaveState,
-) void {
-    while (@as(
-        SlaveState,
-        @enumFromInt(soem.ecx_readstate(ctx)),
-    ) == req_state) {}
+/// Close the ethercat connection
+pub fn deinit(ctx: *soem.ecx_contextt) void {
+    soem.ecx_close(ctx);
 }
-
 /// Wrapper for SOEM functions that may return error code.
 ///
 /// Usage: `error_handling(ctx, SOEM_FUNCTION_CALL())`;
