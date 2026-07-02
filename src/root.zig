@@ -14,12 +14,12 @@ var io_map: [max_stations * @bitSizeOf(ProcessData)]u8 = undefined;
 
 pub const ProcessData = extern struct {
     output: extern struct {
-        y: u64,
-        ww: u256,
+        y: [8]u8,
+        ww: [16]u16,
     },
     input: extern struct {
-        x: u64,
-        wr: u256,
+        x: [8]u8,
+        wr: [16]u16,
         status: u16,
         heartbeat_counter: u16,
     },
@@ -29,7 +29,7 @@ pub const ProcessData = extern struct {
 /// state. This function is intended to be called by Zig Group/Select interface
 /// to support cancelation. To close the connection, cancel the thread.
 pub fn process(ctx: *soem.ecx_contextt, ifname: []const u8) !void {
-    error_handling(ctx, soem.ecx_init(ctx, ifname));
+    try error_handling(ctx, soem.ecx_init(ctx, @ptrCast(ifname)));
     defer soem.ecx_close(ctx);
     const size = soem.ecx_config_map_group(ctx, &io_map, 0);
     const expected_WKC =
@@ -50,7 +50,7 @@ pub fn process(ctx: *soem.ecx_contextt, ifname: []const u8) !void {
     }
     // Asks the slaves to be in operational state
     ctx.slavelist[0].state = @intFromEnum(SlaveState.EC_STATE_OPERATIONAL);
-    soem.ecx_writestate(ctx, 0);
+    _ = soem.ecx_writestate(ctx, 0);
     while (@as(
         SlaveState,
         @enumFromInt(soem.ecx_readstate(ctx)),
@@ -84,12 +84,12 @@ fn waitState(
 /// Wrapper for SOEM functions that may return error code.
 ///
 /// Usage: `error_handling(ctx, SOEM_FUNCTION_CALL())`;
-fn error_handling(ctx: *soem.ecx_contextt, code: usize) !void {
+fn error_handling(ctx: *soem.ecx_contextt, code: c_int) !void {
     if (code == 0) return;
     var err: soem.ec_errort = std.mem.zeroInit(soem.ec_errort, .{});
     if (soem.ecx_poperror(ctx, &err) > 0) {
         const err_code: ErrorCode = @enumFromInt(err.Etype);
-        soem.ecx_err2string(err);
+        std.log.err("{s}", .{soem.ecx_err2string(err)});
         try err_code.throwError();
     } else return error.PopErrorFailed;
 }
@@ -121,6 +121,7 @@ const ErrorCode = enum(u8) {
             .EC_ERR_TYPE_MBX_ERROR => return error.MBXError,
             .EC_ERR_TYPE_FOE_FILE_NOTFOUND => return error.FOEFileNotFound,
             .EC_ERR_TYPE_EOE_INVALID_RX_DATA => return error.InvalidRxData,
+            _ => unreachable,
         }
     }
 };
