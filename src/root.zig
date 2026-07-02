@@ -9,33 +9,72 @@ pub const soem = @import("soem");
 // - Close the connection
 // - Error handling
 
-const max_stations = 64;
-var io_map: [max_stations * @bitSizeOf(ProcessData)]u8 = undefined;
+pub const IoMap = []const u8;
 
 pub const ProcessData = extern struct {
-    output: extern struct {
-        y: [8]u8,
-        ww: [16]u16,
-    },
-    input: extern struct {
-        x: [8]u8,
-        wr: [16]u16,
-        status: u16,
-        heartbeat_counter: u16,
-    },
+    output: Output,
+    input: Input,
+
+    pub const Output = extern struct {
+        slaves: []Slave,
+        pub const Slave = struct {
+            y: [8]u8,
+            ww: [16]u16,
+        };
+    };
+
+    pub const Input = extern struct {
+        slaves: []Slave,
+        pub const Slave = struct {
+            x: [8]u8,
+            wr: [16]u16,
+            status: u16,
+            heartbeat_counter: u16,
+        };
+    };
+
+    pub const size = @bitSizeOf(Input.Slave) + @bitSizeOf(Output.Slave);
+
+    pub fn init(
+        gpa: std.mem.Allocator,
+        slave_count: u16,
+    ) std.mem.Allocator.Error!ProcessData {
+        var res: ProcessData = undefined;
+        res.input.slaves = try gpa.alloc(Input.Slave, slave_count);
+        res.output.slaves = try gpa.alloc(Output.Slave, slave_count);
+    }
+
+    pub fn deinit(self: ProcessData, gpa: std.mem.Allocator) void {
+        gpa.free(self.input.slaves);
+        gpa.free(self.output.slaves);
+    }
+
+    pub fn map(self: *ProcessData, io_map: IoMap) void {
+        self = @ptrCast(io_map);
+    }
 };
 
 /// Initialize the ethercat connection to slaves. After calling this function,
 /// user must keep `process()` alive on other thread. Failing to keep
 /// `process()` alive may terminate the connection. Caller also must call
 /// deinit upon finishing with the connection.
-pub fn init(ctx: *soem.ecx_contextt, ifname: []const u8) !void {
+pub fn init(
+    gpa: std.mem.Allocator,
+    ctx: *soem.ecx_contextt,
+    ifname: []const u8,
+) !IoMap {
     try error_handling(ctx, soem.ecx_init(ctx, @ptrCast(ifname)));
     errdefer soem.ecx_close(ctx);
+    const stations = soem.ecx_config_init(ctx);
+    if (stations <= 0) {
+        return error.NoSlavesFound;
+    }
+    const io_map = try gpa.alloc(u8, stations * ProcessData.size);
+    errdefer gpa.free(io_map);
     const size = soem.ecx_config_map_group(ctx, &io_map, 0);
     const expected_WKC =
         ctx.grouplist[0].outputsWKC * 2 + ctx.grouplist[0].inputsWKC;
-    if (size > max_stations) return error.StationNumberOverflow;
+    if (size > io_map.len) return error.IoMapOverflow;
     _ = soem.ecx_configdc(ctx);
     // Wait until all slaves are in SAFE_OP state.
     while (true) {
@@ -70,6 +109,7 @@ pub fn init(ctx: *soem.ecx_contextt, ifname: []const u8) !void {
             return error.InvalidWorkCounter;
         }
     }
+    return io_map;
 }
 
 /// Maintain the connection to the slaves.
