@@ -11,21 +11,18 @@ pub const soem = @import("soem");
 
 pub const IoMap = []u8;
 
-pub const ProcessData = extern struct {
-    output: Output,
-    input: Input,
+pub const ProcessData = struct {
+    slaves: []Slave,
 
-    pub const Output = extern struct {
-        slaves: [*c]Slave,
-        pub const Slave = extern struct {
+    pub const Slave = struct {
+        input: Input,
+        output: Output,
+        pub const Output = struct {
             y: [8]u8,
             ww: [16]u16,
         };
-    };
 
-    pub const Input = extern struct {
-        slaves: [*c]Slave,
-        pub const Slave = extern struct {
+        pub const Input = struct {
             x: [8]u8,
             wr: [16]u16,
             status: u16,
@@ -33,7 +30,49 @@ pub const ProcessData = extern struct {
         };
     };
 
-    pub const size = @bitSizeOf(Input.Slave) + @bitSizeOf(Output.Slave);
+    /// Allocate required memory to store process data from ethercat. Caller
+    /// must call deinit upon completion.
+    pub fn init(gpa: std.mem.Allocator, station_num: usize) std.mem.Allocator.Error!ProcessData {
+        var res: ProcessData = undefined;
+        res.slaves = try gpa.alloc(Slave, station_num);
+        return res;
+    }
+
+    pub fn deinit(self: ProcessData, gpa: std.mem.Allocator) void {
+        gpa.free(self.slaves);
+    }
+
+    /// Update the process data from soem context. Caller must ensure send and
+    /// receive process data must be done periodically.
+    pub fn update(self: *ProcessData, soem_ctx: soem.ecx_contextt) void {
+        const slaves_num: usize = @intCast(soem_ctx.slavecount);
+        for (self.slaves, soem_ctx.slavelist[0..slaves_num]) |*slave, source| {
+            @memcpy(
+                slave.input.x[0..slave.input.x.len],
+                source.inputs[0..@sizeOf(@TypeOf(slave.input.x))],
+            );
+            @memcpy(
+                slave.input.wr[0..slave.input.wr.len],
+                @as(
+                    []u16,
+                    @ptrCast(@alignCast(source.inputs[@sizeOf(@TypeOf(slave.input.x)) .. @sizeOf(@TypeOf(slave.input.x)) + @sizeOf(@TypeOf(slave.input.wr))])),
+                ),
+            );
+            @memcpy(
+                slave.output.y[0..slave.output.y.len],
+                source.outputs[0..@sizeOf(@TypeOf(slave.output.y))],
+            );
+            @memcpy(
+                slave.output.ww[0..slave.output.ww.len],
+                @as(
+                    []u16,
+                    @ptrCast(@alignCast(source.outputs[@sizeOf(@TypeOf(slave.output.y)) .. @sizeOf(@TypeOf(slave.output.y)) + @sizeOf(@TypeOf(slave.output.ww))])),
+                ),
+            );
+        }
+    }
+
+    pub const size = @bitSizeOf(Slave.Input) + @bitSizeOf(Slave.Output);
 };
 
 /// Initialize the ethercat connection to slaves. After calling this function,
@@ -45,13 +84,16 @@ pub fn init(
     ctx: *soem.ecx_contextt,
     ifname: []const u8,
 ) !IoMap {
-    try error_handling(ctx, soem.ecx_init(ctx, @ptrCast(ifname)));
+    if (soem.ecx_init(ctx, ifname.ptr) <= 0) {
+        return error.SoemInitializationFailed;
+    }
     errdefer soem.ecx_close(ctx);
     const stations: usize = @intCast(soem.ecx_config_init(ctx));
     if (stations <= 0) {
         return error.NoSlavesFound;
     }
-    const io_map = try gpa.alloc(u8, stations * ProcessData.size);
+    // `+ stations` for accomodating mbxstatuslength
+    const io_map = try gpa.alloc(u8, stations * ProcessData.size + stations);
     errdefer gpa.free(io_map);
     const size = soem.ecx_config_map_group(
         ctx,
