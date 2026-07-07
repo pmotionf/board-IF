@@ -87,11 +87,13 @@ pub fn init(
     if (soem.ecx_init(ctx, ifname.ptr) <= 0) {
         return error.SoemInitializationFailed;
     }
+    std.log.debug("ecx_init on {s} succeeded", .{ifname});
     errdefer soem.ecx_close(ctx);
     const stations: usize = @intCast(soem.ecx_config_init(ctx));
     if (stations <= 0) {
         return error.NoSlavesFound;
     }
+    std.log.debug("Found {} slaves", .{stations});
     // `+ stations` for accomodating mbxstatuslength
     const io_map = try gpa.alloc(u8, stations * ProcessData.size + stations);
     errdefer gpa.free(io_map);
@@ -100,32 +102,28 @@ pub fn init(
         @ptrCast(@alignCast(io_map)),
         0,
     );
+    std.log.debug("IO map allocated", .{});
     const expected_WKC =
         ctx.grouplist[0].outputsWKC * 2 + ctx.grouplist[0].inputsWKC;
     if (size > io_map.len) return error.IoMapOverflow;
     _ = soem.ecx_configdc(ctx);
     // Wait until all slaves are in SAFE_OP state.
-    while (true) {
-        const code = soem.ecx_readstate(ctx);
-        if (code > std.math.maxInt(@typeInfo(SlaveState).@"enum".tag_type)) {
-            return error.InvalidReadState;
-        }
-        if (@as(SlaveState, @enumFromInt(soem.ecx_readstate(ctx))) ==
-            SlaveState.EC_STATE_SAFE_OP) break;
-    }
-    while (@as(
-        SlaveState,
-        @enumFromInt(soem.ecx_readstate(ctx)),
-    ) == SlaveState.EC_STATE_SAFE_OP) {}
-    std.log.info("All slaves enter safe operational state", .{});
+    _ = soem.ecx_statecheck(
+        ctx,
+        0,
+        soem.EC_STATE_SAFE_OP,
+        soem.EC_TIMEOUTSTATE * 4,
+    );
+    std.log.debug("All slaves enter safe operational state", .{});
     // Ensure slaves have valid output
     if (soem.ecx_send_processdata(ctx) != expected_WKC and
         soem.ecx_receive_processdata(ctx, soem.EC_TIMEOUTRET) != expected_WKC)
     {
         return error.InvalidWorkCounter;
     }
+    std.log.debug("Valid workcounter found", .{});
     // Asks the slaves to be in operational state
-    ctx.slavelist[0].state = @intFromEnum(SlaveState.EC_STATE_OPERATIONAL);
+    ctx.slavelist[0].state = soem.EC_STATE_OPERATIONAL;
     _ = soem.ecx_writestate(ctx, 0);
     while (@as(
         SlaveState,
@@ -137,6 +135,7 @@ pub fn init(
             return error.InvalidWorkCounter;
         }
     }
+    std.log.debug("Connected to ethercat", .{});
     return io_map;
 }
 
@@ -150,6 +149,7 @@ pub fn process(io: std.Io, ctx: *soem.ecx_contextt) !void {
     const expected_WKC =
         ctx.grouplist[0].outputsWKC * 2 + ctx.grouplist[0].inputsWKC;
     while (true) {
+        std.log.debug("board_if process", .{});
         try io.checkCancel();
         if (soem.ecx_send_processdata(ctx) != expected_WKC and
             soem.ecx_receive_processdata(ctx, soem.EC_TIMEOUTRET) != expected_WKC)
