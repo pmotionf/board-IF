@@ -2,129 +2,64 @@
 const std = @import("std");
 pub const soem = @import("soem");
 
-// Functionality that we want for the board
-// - Initialize the connection, including connect
-// - Read the data
-// - Send the data
-// - Close the connection
-// - Error handling
-
-pub const IoMap = []u8;
-
-pub const ProcessData = struct {
-    slaves: []Slave,
-
-    pub const Slave = struct {
-        input: Input,
-        output: Output,
-        pub const Output = struct {
-            y: [8]u8,
-            ww: [32]u8,
-        };
-
-        pub const Input = struct {
-            x: [8]u8,
-            wr: [32]u8,
-            status: u16,
-            heartbeat_counter: u16,
-        };
-    };
-
-    /// Allocate required memory to store process data from ethercat. Caller
-    /// must call deinit upon completion.
-    pub fn init(gpa: std.mem.Allocator, station_num: usize) std.mem.Allocator.Error!ProcessData {
-        var res: ProcessData = undefined;
-        res.slaves = try gpa.alloc(Slave, station_num);
-        return res;
-    }
-
-    pub fn deinit(self: ProcessData, gpa: std.mem.Allocator) void {
-        gpa.free(self.slaves);
-    }
-
-    /// Update the process data from soem context. Caller must ensure send and
-    /// receive process data must be done periodically.
-    pub fn update(self: *ProcessData, soem_ctx: soem.ecx_contextt) void {
-        const slaves_num: usize = @intCast(soem_ctx.slavecount);
-        for (self.slaves, soem_ctx.slavelist[1 .. slaves_num + 1]) |*slave, source| {
-            std.log.debug("source: {}", .{source});
-            // std.log.debug(
-            //     "\ninput: {any}\noutput: {any}",
-            //     .{ source.inputs[0..@sizeOf(Slave.Input)], source.outputs[0..@sizeOf(Slave.Output)] },
-            // );
-            @memcpy(
-                slave.input.x[0..slave.input.x.len],
-                source.inputs[0..@sizeOf(@TypeOf(slave.input.x))],
-            );
-            @memcpy(
-                slave.input.wr[0..slave.input.wr.len],
-                source.inputs[@sizeOf(@TypeOf(slave.input.x)) .. @sizeOf(@TypeOf(slave.input.x)) + @sizeOf(@TypeOf(slave.input.wr))],
-            );
-            @memcpy(
-                slave.output.y[0..slave.output.y.len],
-                source.outputs[0..@sizeOf(@TypeOf(slave.output.y))],
-            );
-            @memcpy(
-                slave.output.ww[0..slave.output.ww.len],
-                source.outputs[@sizeOf(@TypeOf(slave.output.y)) .. @sizeOf(@TypeOf(slave.output.y)) + @sizeOf(@TypeOf(slave.output.ww))],
-            );
-        }
-    }
-
-    pub const size = @sizeOf(Slave.Input) + @sizeOf(Slave.Output);
-};
+io_map: []u8,
+ctx: soem.ecx_contextt,
+lock: std.Io.RwLock,
 
 /// Initialize the ethercat connection and ensure all slaves are in safe
 /// operational state. User must spawn a `process` thread for exhanging
 /// information to all slaves to ensure the slave's watchdogs is not triggered.
 pub fn init(
     gpa: std.mem.Allocator,
-    ctx: *soem.ecx_contextt,
     ifname: []const u8,
-) !IoMap {
-    if (soem.ecx_init(ctx, ifname.ptr) <= 0) {
+) !@This() {
+    var res: @This() = undefined;
+    res.lock = .init;
+    res.ctx = std.mem.zeroInit(soem.ecx_contextt, .{});
+    if (soem.ecx_init(&res.ctx, ifname.ptr) <= 0) {
         return error.SoemInitializationFailed;
     }
-    errdefer soem.ecx_close(ctx);
+    errdefer soem.ecx_close(&res.ctx);
     // Wait until all slaves are in INIT state.
-    checkSlaveState(ctx, soem.EC_STATE_INIT);
-    const stations: usize = @intCast(soem.ecx_config_init(ctx));
+    checkSlaveState(&res.ctx, soem.EC_STATE_INIT);
+    const stations: usize = @intCast(soem.ecx_config_init(&res.ctx));
     if (stations <= 0) return error.NoSlavesFound;
     // Wait until all slaves are in PRE_OP state.
-    checkSlaveState(ctx, soem.EC_STATE_PRE_OP);
+    checkSlaveState(&res.ctx, soem.EC_STATE_PRE_OP);
     // Configure SM2 and SM3 for each slaves. This is a bug in the firmware
     // that the SM for PDO mapping is not configured correctly.
-    for (ctx.slavelist[1 .. @as(usize, @intCast(ctx.slavecount)) + 1]) |*slave| {
+    for (res.ctx.slavelist[1 .. @as(usize, @intCast(res.ctx.slavecount)) + 1]) |*slave| {
         slave.SM[2] = .{ .StartAddr = 0x1100, .SMlength = 42, .SMflags = 0x64 };
         slave.SM[3] = .{ .StartAddr = 0x1180, .SMlength = 44, .SMflags = 0x20 };
     }
-    const io_map = try gpa.alloc(u8, stations * ProcessData.size + stations);
-    errdefer gpa.free(io_map);
+    // TODO: Find a way to not use magic number as the buffer for IO Map.
+    res.io_map = try gpa.alloc(u8, 4096);
+    errdefer gpa.free(res.io_map);
     const size = soem.ecx_config_map_group(
-        ctx,
-        @ptrCast(@alignCast(io_map)),
+        &res.ctx,
+        @ptrCast(@alignCast(res.io_map)),
         0,
     );
     const expected_WKC =
-        ctx.grouplist[0].outputsWKC * 2 + ctx.grouplist[0].inputsWKC;
-    if (size > io_map.len) return error.IoMapOverflow;
-    _ = soem.ecx_configdc(ctx);
+        res.ctx.grouplist[0].outputsWKC * 2 + res.ctx.grouplist[0].inputsWKC;
+    if (size > res.io_map.len) return error.IoMapOverflow;
+    _ = soem.ecx_configdc(&res.ctx);
     // Wait until all slaves are in SAFE_OP state.
-    checkSlaveState(ctx, soem.EC_STATE_SAFE_OP);
+    checkSlaveState(&res.ctx, soem.EC_STATE_SAFE_OP);
     // Ensure slaves have valid output
-    if (soem.ecx_send_processdata(ctx) != expected_WKC or
-        soem.ecx_receive_processdata(ctx, soem.EC_TIMEOUTRET) != expected_WKC)
+    if (soem.ecx_send_processdata(&res.ctx) != expected_WKC or
+        soem.ecx_receive_processdata(&res.ctx, soem.EC_TIMEOUTRET) != expected_WKC)
     {
         return error.InvalidWorkCounter;
     }
     std.log.debug("Connected to ethercat", .{});
-    return io_map;
+    return res;
 }
 
 /// Asks slaves to be in operational state and maintain process data exchange.
 pub fn process(
     io: std.Io,
-    ctx: *soem.ecx_contextt,
+    board: *@This(),
 ) (std.Io.Cancelable || error{InvalidWorkCounter})!void {
     defer {
         if (@errorReturnTrace()) |error_trace| {
@@ -132,35 +67,38 @@ pub fn process(
         }
     }
     // Asks the slaves to be in operational state
-    ctx.slavelist[0].state = soem.EC_STATE_OPERATIONAL;
-    _ = soem.ecx_writestate(ctx, 0);
+    board.ctx.slavelist[0].state = soem.EC_STATE_OPERATIONAL;
+    _ = soem.ecx_writestate(&board.ctx, 0);
     // Ensuring all slaves reach operational state
     while (true) {
         try io.checkCancel();
-        if (soem.ecx_readstate(ctx) == soem.EC_STATE_OPERATIONAL) break;
+        if (soem.ecx_readstate(&board.ctx) == soem.EC_STATE_OPERATIONAL) break;
     }
     const expected_WKC =
-        ctx.grouplist[0].outputsWKC * 2 + ctx.grouplist[0].inputsWKC;
+        board.ctx.grouplist[0].outputsWKC * 2 + board.ctx.grouplist[0].inputsWKC;
     var timestamp: std.Io.Timestamp = .now(io, .real);
     const update_rate_us = 1000;
     while (true) {
-        if (soem.ecx_send_processdata(ctx) != expected_WKC or
-            soem.ecx_receive_processdata(ctx, soem.EC_TIMEOUTRET) != expected_WKC)
+        try board.lock.lock(io);
+        if (soem.ecx_send_processdata(&board.ctx) != expected_WKC or
+            soem.ecx_receive_processdata(&board.ctx, soem.EC_TIMEOUTRET) != expected_WKC)
         {
             return error.InvalidWorkCounter;
         }
+        board.lock.unlock(io);
         const current = timestamp.untilNow(io, .real).toMicroseconds();
         try io.sleep(.fromMicroseconds(update_rate_us - current), .real);
     }
 }
 
 /// Close the ethercat connection
-pub fn deinit(ctx: *soem.ecx_contextt) void {
-    soem.ecx_close(ctx);
+pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
+    soem.ecx_close(&self.ctx);
+    gpa.free(self.io_map);
 }
 
 /// Check whether all slaves already in the specified state
-fn checkSlaveState(ctx: *soem.ecx_contextt, state: c_int) void {
+fn checkSlaveState(ctx: *soem.ecx_contextt, state: u16) void {
     const slave_state: SlaveState = @enumFromInt(state);
     ctx.slavelist[0].state = state;
     _ = soem.ecx_writestate(ctx, 0);
@@ -313,3 +251,7 @@ const ALStatusCode = enum(u16) {
     Unknown = 0xffff,
     _,
 };
+
+test {
+    std.testing.refAllDecls(@This());
+}
