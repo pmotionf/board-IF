@@ -19,12 +19,12 @@ pub const ProcessData = struct {
         output: Output,
         pub const Output = struct {
             y: [8]u8,
-            ww: [16]u16,
+            ww: [32]u8,
         };
 
         pub const Input = struct {
             x: [8]u8,
-            wr: [16]u16,
+            wr: [32]u8,
             status: u16,
             heartbeat_counter: u16,
         };
@@ -46,17 +46,19 @@ pub const ProcessData = struct {
     /// receive process data must be done periodically.
     pub fn update(self: *ProcessData, soem_ctx: soem.ecx_contextt) void {
         const slaves_num: usize = @intCast(soem_ctx.slavecount);
-        for (self.slaves, soem_ctx.slavelist[0..slaves_num]) |*slave, source| {
+        for (self.slaves, soem_ctx.slavelist[1 .. slaves_num + 1]) |*slave, source| {
+            std.log.debug("source: {}", .{source});
+            // std.log.debug(
+            //     "\ninput: {any}\noutput: {any}",
+            //     .{ source.inputs[0..@sizeOf(Slave.Input)], source.outputs[0..@sizeOf(Slave.Output)] },
+            // );
             @memcpy(
                 slave.input.x[0..slave.input.x.len],
                 source.inputs[0..@sizeOf(@TypeOf(slave.input.x))],
             );
             @memcpy(
                 slave.input.wr[0..slave.input.wr.len],
-                @as(
-                    []u16,
-                    @ptrCast(@alignCast(source.inputs[@sizeOf(@TypeOf(slave.input.x)) .. @sizeOf(@TypeOf(slave.input.x)) + @sizeOf(@TypeOf(slave.input.wr))])),
-                ),
+                source.inputs[@sizeOf(@TypeOf(slave.input.x)) .. @sizeOf(@TypeOf(slave.input.x)) + @sizeOf(@TypeOf(slave.input.wr))],
             );
             @memcpy(
                 slave.output.y[0..slave.output.y.len],
@@ -64,21 +66,17 @@ pub const ProcessData = struct {
             );
             @memcpy(
                 slave.output.ww[0..slave.output.ww.len],
-                @as(
-                    []u16,
-                    @ptrCast(@alignCast(source.outputs[@sizeOf(@TypeOf(slave.output.y)) .. @sizeOf(@TypeOf(slave.output.y)) + @sizeOf(@TypeOf(slave.output.ww))])),
-                ),
+                source.outputs[@sizeOf(@TypeOf(slave.output.y)) .. @sizeOf(@TypeOf(slave.output.y)) + @sizeOf(@TypeOf(slave.output.ww))],
             );
         }
     }
 
-    pub const size = @bitSizeOf(Slave.Input) + @bitSizeOf(Slave.Output);
+    pub const size = @sizeOf(Slave.Input) + @sizeOf(Slave.Output);
 };
 
-/// Initialize the ethercat connection to slaves. After calling this function,
-/// user must keep `process()` alive on other thread. Failing to keep
-/// `process()` alive may terminate the connection. Caller also must call
-/// deinit upon finishing with the connection.
+/// Initialize the ethercat connection and ensure all slaves are in safe
+/// operational state. User must spawn a `process` thread for exhanging
+/// information to all slaves to ensure the slave's watchdogs is not triggered.
 pub fn init(
     gpa: std.mem.Allocator,
     ctx: *soem.ecx_contextt,
@@ -87,14 +85,19 @@ pub fn init(
     if (soem.ecx_init(ctx, ifname.ptr) <= 0) {
         return error.SoemInitializationFailed;
     }
-    std.log.debug("ecx_init on {s} succeeded", .{ifname});
     errdefer soem.ecx_close(ctx);
+    // Wait until all slaves are in INIT state.
+    checkSlaveState(ctx, soem.EC_STATE_INIT);
     const stations: usize = @intCast(soem.ecx_config_init(ctx));
-    if (stations <= 0) {
-        return error.NoSlavesFound;
+    if (stations <= 0) return error.NoSlavesFound;
+    // Wait until all slaves are in PRE_OP state.
+    checkSlaveState(ctx, soem.EC_STATE_PRE_OP);
+    // Configure SM2 and SM3 for each slaves. This is a bug in the firmware
+    // that the SM for PDO mapping is not configured correctly.
+    for (ctx.slavelist[1 .. @as(usize, @intCast(ctx.slavecount)) + 1]) |*slave| {
+        slave.SM[2] = .{ .StartAddr = 0x1100, .SMlength = 42, .SMflags = 0x64 };
+        slave.SM[3] = .{ .StartAddr = 0x1180, .SMlength = 44, .SMflags = 0x20 };
     }
-    std.log.debug("Found {} slaves", .{stations});
-    // `+ stations` for accomodating mbxstatuslength
     const io_map = try gpa.alloc(u8, stations * ProcessData.size + stations);
     errdefer gpa.free(io_map);
     const size = soem.ecx_config_map_group(
@@ -102,60 +105,52 @@ pub fn init(
         @ptrCast(@alignCast(io_map)),
         0,
     );
-    std.log.debug("IO map allocated", .{});
     const expected_WKC =
         ctx.grouplist[0].outputsWKC * 2 + ctx.grouplist[0].inputsWKC;
     if (size > io_map.len) return error.IoMapOverflow;
     _ = soem.ecx_configdc(ctx);
     // Wait until all slaves are in SAFE_OP state.
-    _ = soem.ecx_statecheck(
-        ctx,
-        0,
-        soem.EC_STATE_SAFE_OP,
-        soem.EC_TIMEOUTSTATE * 4,
-    );
-    std.log.debug("All slaves enter safe operational state", .{});
+    checkSlaveState(ctx, soem.EC_STATE_SAFE_OP);
     // Ensure slaves have valid output
-    if (soem.ecx_send_processdata(ctx) != expected_WKC and
+    if (soem.ecx_send_processdata(ctx) != expected_WKC or
         soem.ecx_receive_processdata(ctx, soem.EC_TIMEOUTRET) != expected_WKC)
     {
         return error.InvalidWorkCounter;
-    }
-    std.log.debug("Valid workcounter found", .{});
-    // Asks the slaves to be in operational state
-    ctx.slavelist[0].state = soem.EC_STATE_OPERATIONAL;
-    _ = soem.ecx_writestate(ctx, 0);
-    while (@as(
-        SlaveState,
-        @enumFromInt(soem.ecx_readstate(ctx)),
-    ) == SlaveState.EC_STATE_OPERATIONAL) {
-        if (soem.ecx_send_processdata(ctx) != expected_WKC and
-            soem.ecx_receive_processdata(ctx, soem.EC_TIMEOUTRET) != expected_WKC)
-        {
-            return error.InvalidWorkCounter;
-        }
     }
     std.log.debug("Connected to ethercat", .{});
     return io_map;
 }
 
-/// Maintain the connection to the slaves.
-pub fn process(io: std.Io, ctx: *soem.ecx_contextt) !void {
+/// Asks slaves to be in operational state and maintain process data exchange.
+pub fn process(
+    io: std.Io,
+    ctx: *soem.ecx_contextt,
+) (std.Io.Cancelable || error{InvalidWorkCounter})!void {
     defer {
         if (@errorReturnTrace()) |error_trace| {
             std.debug.dumpErrorReturnTrace(error_trace);
         }
     }
+    // Asks the slaves to be in operational state
+    ctx.slavelist[0].state = soem.EC_STATE_OPERATIONAL;
+    _ = soem.ecx_writestate(ctx, 0);
+    // Ensuring all slaves reach operational state
+    while (true) {
+        try io.checkCancel();
+        if (soem.ecx_readstate(ctx) == soem.EC_STATE_OPERATIONAL) break;
+    }
     const expected_WKC =
         ctx.grouplist[0].outputsWKC * 2 + ctx.grouplist[0].inputsWKC;
+    var timestamp: std.Io.Timestamp = .now(io, .real);
+    const update_rate_us = 1000;
     while (true) {
-        std.log.debug("board_if process", .{});
-        try io.checkCancel();
-        if (soem.ecx_send_processdata(ctx) != expected_WKC and
+        if (soem.ecx_send_processdata(ctx) != expected_WKC or
             soem.ecx_receive_processdata(ctx, soem.EC_TIMEOUTRET) != expected_WKC)
         {
             return error.InvalidWorkCounter;
         }
+        const current = timestamp.untilNow(io, .real).toMicroseconds();
+        try io.sleep(.fromMicroseconds(update_rate_us - current), .real);
     }
 }
 
@@ -163,6 +158,30 @@ pub fn process(io: std.Io, ctx: *soem.ecx_contextt) !void {
 pub fn deinit(ctx: *soem.ecx_contextt) void {
     soem.ecx_close(ctx);
 }
+
+/// Check whether all slaves already in the specified state
+fn checkSlaveState(ctx: *soem.ecx_contextt, state: c_int) void {
+    const slave_state: SlaveState = @enumFromInt(state);
+    ctx.slavelist[0].state = state;
+    _ = soem.ecx_writestate(ctx, 0);
+    _ = soem.ecx_statecheck(ctx, 0, state, soem.EC_TIMEOUTSTATE * 4);
+    if (ctx.slavelist[0].state != state) {
+        std.log.warn("Not all slave enter {t} state", .{slave_state});
+        _ = soem.ecx_readstate(ctx);
+        for (ctx.slavelist[1 .. @as(usize, @intCast(ctx.slavecount)) + 1]) |slave| {
+            std.log.warn(
+                "slave state: {t}, AL code: {}",
+                .{
+                    @as(SlaveState, @enumFromInt(slave.state)),
+                    slave.ALstatuscode,
+                },
+            );
+        }
+    } else {
+        std.log.debug("All slaves enter {t}", .{slave_state});
+    }
+}
+
 /// Wrapper for SOEM functions that may return error code.
 ///
 /// Usage: `error_handling(ctx, SOEM_FUNCTION_CALL())`;
@@ -208,6 +227,8 @@ const ErrorCode = enum(u8) {
     }
 };
 
+// TODO: If an error occur, the slave state will be its state + error. When it
+// shows an error, user have to check the AL status code.
 const SlaveState = enum(u5) {
     /// No valid state.
     EC_STATE_NONE = 0x00,
@@ -223,4 +244,72 @@ const SlaveState = enum(u5) {
     EC_STATE_OPERATIONAL = 0x08,
     // Error or ACK Error
     EC_STATE_ACK_ERROR = 0x10,
+};
+
+const ALStatusCode = enum(u16) {
+    No_error = 0x0000,
+    Unspecified_error = 0x0001,
+    No_memory = 0x0002,
+    Invalid_device_setup = 0x0003,
+    Invalid_revision = 0x0004,
+    SII_EEPROM_information_does_not_match_firmware = 0x0006,
+    Firmware_update_not_successful = 0x0007,
+    License_error = 0x000E,
+    Invalid_requested_state_change = 0x0011,
+    Unknown_requested_state = 0x0012,
+    Bootstrap_not_supported = 0x0013,
+    No_valid_firmware = 0x0014,
+    Invalid_mailbox_configuration_0 = 0x0015,
+    Invalid_mailbox_configuration_1 = 0x0016,
+    Invalid_sync_manager_configuration = 0x0017,
+    No_valid_inputs_available = 0x0018,
+    No_valid_outputs = 0x0019,
+    Synchronization_error = 0x001A,
+    Sync_manager_watchdog = 0x001B,
+    Invalid_sync_Manager_types = 0x001C,
+    Invalid_output_configuration = 0x001D,
+    Invalid_input_configuration = 0x001E,
+    Invalid_watchdog_configuration = 0x001F,
+    Slave_needs_cold_start = 0x0020,
+    Slave_needs_INIT = 0x0021,
+    Slave_needs_PREOP = 0x0022,
+    Slave_needs_SAFEOP = 0x0023,
+    Invalid_input_mapping = 0x0024,
+    Invalid_output_mapping = 0x0025,
+    Inconsistent_settings = 0x0026,
+    Freerun_not_supported = 0x0027,
+    Synchronisation_not_supported = 0x0028,
+    Freerun_needs_3buffer_mode = 0x0029,
+    Background_watchdog = 0x002A,
+    No_valid_Inputs_and_Outputs = 0x002B,
+    Fatal_sync_error = 0x002C,
+    No_sync_error = 0x002D,
+    Invalid_input_FMMU_configuration = 0x002E,
+    Invalid_DC_SYNC_configuration = 0x0030,
+    Invalid_DC_latch_configuration = 0x0031,
+    PLL_error = 0x0032,
+    DC_sync_IO_error = 0x0033,
+    DC_sync_timeout_error = 0x0034,
+    DC_invalid_sync_cycle_time = 0x0035,
+    DC_invalid_sync0_cycle_time = 0x0036,
+    DC_invalid_sync1_cycle_time = 0x0037,
+    MBX_AOE = 0x0041,
+    MBX_EOE = 0x0042,
+    MBX_COE = 0x0043,
+    MBX_FOE = 0x0044,
+    MBX_SOE = 0x0045,
+    MBX_VOE = 0x004F,
+    EEPROM_no_access = 0x0050,
+    EEPROM_error = 0x0051,
+    External_hardware_not_ready = 0x0052,
+    Slave_restarted_locally = 0x0060,
+    Device_identification_value_updated = 0x0061,
+    Detected_Module_Ident_List_does_not_match = 0x0070,
+    Supply_voltage_too_low = 0x0080,
+    Supply_voltage_too_high = 0x0081,
+    Temperature_too_low = 0x0082,
+    Temperature_too_high = 0x0083,
+    Application_controller_available = 0x00f0,
+    Unknown = 0xffff,
+    _,
 };
