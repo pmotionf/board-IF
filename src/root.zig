@@ -19,6 +19,7 @@ pub fn init(gpa: std.mem.Allocator, ifname: []const u8) !@This() {
     };
     errdefer res.deinit(gpa);
     res.ctx = try gpa.create(soem.ecx_contextt);
+    res.ctx.* = std.mem.zeroInit(soem.ecx_contextt, .{});
     // TODO: Find a way to calculate required memory before even initializing connectioni to ethercat
     res.io_map = try gpa.alloc(u8, 4096);
     res.ifname = try gpa.dupe(u8, ifname);
