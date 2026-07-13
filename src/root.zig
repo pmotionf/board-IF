@@ -4,20 +4,21 @@ pub const soem = @import("soem");
 
 io_map: []u8,
 ifname: []u8,
-ctx: soem.ecx_contextt,
+ctx: *soem.ecx_contextt,
 lock: std.Io.RwLock,
 expected_wkc: u16,
 
 /// Allocate required memory for establishing ethercat connection.
 pub fn init(gpa: std.mem.Allocator, ifname: []const u8) !@This() {
     var res: @This() = .{
-        .ctx = std.mem.zeroInit(soem.ecx_contextt, .{}),
+        .ctx = undefined,
         .lock = .init,
         .io_map = &.{},
         .ifname = &.{},
         .expected_wkc = 0,
     };
     errdefer res.deinit(gpa);
+    res.ctx = try gpa.create(soem.ecx_contextt);
     // TODO: Find a way to calculate required memory before even initializing connectioni to ethercat
     res.io_map = try gpa.alloc(u8, 4096);
     res.ifname = try gpa.dupe(u8, ifname);
@@ -25,8 +26,9 @@ pub fn init(gpa: std.mem.Allocator, ifname: []const u8) !@This() {
 }
 
 /// Close and free all allocated memory for ethercat interface.
-pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
-    soem.ecx_close(&self.ctx);
+pub fn deinit(self: @This(), gpa: std.mem.Allocator) void {
+    soem.ecx_close(self.ctx);
+    gpa.destroy(self.ctx);
     gpa.free(self.ifname);
     gpa.free(self.io_map);
 }
@@ -35,16 +37,16 @@ pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
 /// operational state. User must spawn a `process` thread for exhanging
 /// information to all slaves to ensure the slave's watchdogs is not triggered.
 pub fn open(self: *@This()) !void {
-    if (soem.ecx_init(&self.ctx, self.ifname.ptr) <= 0) {
+    if (soem.ecx_init(self.ctx, self.ifname.ptr) <= 0) {
         return error.SoemInitializationFailed;
     }
-    errdefer soem.ecx_close(&self.ctx);
+    errdefer soem.ecx_close(self.ctx);
     // Wait until all slaves are in INIT state.
-    checkSlaveState(&self.ctx, soem.EC_STATE_INIT);
-    const stations: usize = @intCast(soem.ecx_config_init(&self.ctx));
+    checkSlaveState(self.ctx, soem.EC_STATE_INIT);
+    const stations: usize = @intCast(soem.ecx_config_init(self.ctx));
     if (stations <= 0) return error.NoSlavesFound;
     // Wait until all slaves are in PRE_OP state.
-    checkSlaveState(&self.ctx, soem.EC_STATE_PRE_OP);
+    checkSlaveState(self.ctx, soem.EC_STATE_PRE_OP);
     // Configure SM2 and SM3 for each slaves. This is a bug in the firmware
     // that the SM for PDO mapping is not configured correctly.
     for (self.ctx.slavelist[1 .. @as(usize, @intCast(self.ctx.slavecount)) + 1]) |*slave| {
@@ -52,19 +54,19 @@ pub fn open(self: *@This()) !void {
         slave.SM[3] = .{ .StartAddr = 0x1180, .SMlength = 44, .SMflags = 0x20 };
     }
     const size = soem.ecx_config_map_group(
-        &self.ctx,
+        self.ctx,
         @ptrCast(@alignCast(self.io_map)),
         0,
     );
     if (size > self.io_map.len) return error.IoMapOverflow;
-    _ = soem.ecx_configdc(&self.ctx);
+    _ = soem.ecx_configdc(self.ctx);
     self.expected_wkc =
         self.ctx.grouplist[0].outputsWKC * 2 + self.ctx.grouplist[0].inputsWKC;
     // Wait until all slaves are in SAFE_OP state.
-    checkSlaveState(&self.ctx, soem.EC_STATE_SAFE_OP);
+    checkSlaveState(self.ctx, soem.EC_STATE_SAFE_OP);
     // Ensure slaves have valid output
-    _ = soem.ecx_send_processdata(&self.ctx);
-    const receive_wkc = soem.ecx_receive_processdata(&self.ctx, soem.EC_TIMEOUTRET);
+    _ = soem.ecx_send_processdata(self.ctx);
+    const receive_wkc = soem.ecx_receive_processdata(self.ctx, soem.EC_TIMEOUTRET);
     if (receive_wkc != self.expected_wkc) {
         std.log.debug(
             "expected wkc: {} -- actual wkc: {}",
@@ -89,17 +91,17 @@ pub fn process(
     }
     // Asks the slaves to be in operational state
     board.ctx.slavelist[0].state = soem.EC_STATE_OPERATIONAL;
-    _ = soem.ecx_writestate(&board.ctx, 0);
-    checkSlaveState(&board.ctx, soem.EC_STATE_OPERATIONAL);
+    _ = soem.ecx_writestate(board.ctx, 0);
+    checkSlaveState(board.ctx, soem.EC_STATE_OPERATIONAL);
     // Update all slaves state
-    _ = soem.ecx_readstate(&board.ctx);
+    _ = soem.ecx_readstate(board.ctx);
     var timestamp: std.Io.Timestamp = .now(io, .real);
     const update_rate_us = 1000;
     while (true) {
-        _ = soem.ecx_readstate(&board.ctx);
+        _ = soem.ecx_readstate(board.ctx);
         try board.lock.lock(io);
-        _ = soem.ecx_send_processdata(&board.ctx);
-        if (soem.ecx_receive_processdata(&board.ctx, soem.EC_TIMEOUTRET) != board.expected_wkc) {
+        _ = soem.ecx_send_processdata(board.ctx);
+        if (soem.ecx_receive_processdata(board.ctx, soem.EC_TIMEOUTRET) != board.expected_wkc) {
             return error.InvalidWorkCounter;
         }
         board.lock.unlock(io);
@@ -111,7 +113,7 @@ pub fn process(
 /// Close ethercat connection. Calling this triggers the `process` thread to
 /// exit.
 pub fn close(self: *@This()) void {
-    soem.ecx_close(&self.ctx);
+    soem.ecx_close(self.ctx);
 }
 
 /// Check whether all slaves already in the specified state
