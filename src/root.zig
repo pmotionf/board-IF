@@ -127,7 +127,7 @@ pub fn switchState(self: *@This(), state: u16) void {
     checkSlaveState(self.ctx, state);
 }
 
-/// Check whether all slaves already in the specified state
+/// Check whether all slaves already in the specified state.
 fn checkSlaveState(ctx: *soem.ecx_contextt, state: u16) void {
     const slave_state: SlaveState = @enumFromInt(state);
     _ = soem.ecx_statecheck(ctx, 0, state, soem.EC_TIMEOUTSTATE * 4);
@@ -136,10 +136,10 @@ fn checkSlaveState(ctx: *soem.ecx_contextt, state: u16) void {
         _ = soem.ecx_readstate(ctx);
         for (ctx.slavelist[1 .. @as(usize, @intCast(ctx.slavecount)) + 1]) |slave| {
             std.log.warn(
-                "slave state: {t}, AL code: {}",
+                "slave state: {t}, AL code: {t}",
                 .{
                     @as(SlaveState, @enumFromInt(slave.state)),
-                    slave.ALstatuscode,
+                    @as(ALStatusCode, @enumFromInt(slave.ALstatuscode)),
                 },
             );
         }
@@ -195,24 +195,34 @@ const ErrorCode = enum(u8) {
 
 // TODO: If an error occur, the slave state will be its state + error. When it
 // shows an error, user have to check the AL status code.
-const SlaveState = enum(u5) {
+pub const SlaveState = enum(u5) {
     /// No valid state.
     EC_STATE_NONE = 0x00,
-    /// Init state
+    /// Init state.
     EC_STATE_INIT = 0x01,
-    /// Pre-operational.
+    /// Pre-operational state.
     EC_STATE_PRE_OP = 0x02,
-    /// Boot state
+    /// Boot state.
     EC_STATE_BOOT = 0x03,
-    /// Safe-operational.
+    /// Safe-operational state.
     EC_STATE_SAFE_OP = 0x04,
-    /// Operational
+    /// Operational state.
     EC_STATE_OPERATIONAL = 0x08,
-    // Error or ACK Error
+    // Error or ACK Error state.
     EC_STATE_ACK_ERROR = 0x10,
+    /// Init + error state.
+    EC_STATE_INIT_ERROR = 0x01 | 0x10,
+    /// Pre-operational + error state.
+    EC_STATE_PRE_OP_ERROR = 0x02 | 0x10,
+    /// Boot + error state.
+    EC_STATE_BOOT_ERROR = 0x03 | 0x10,
+    /// Safe-operational + error state.
+    EC_STATE_SAFE_OP_ERROR = 0x04 | 0x10,
+    /// Operational + error state.
+    EC_STATE_OPERATIONAL_ERROR = 0x08 | 0x10,
 };
 
-const ALStatusCode = enum(u16) {
+pub const ALStatusCode = enum(u16) {
     No_error = 0x0000,
     Unspecified_error = 0x0001,
     No_memory = 0x0002,
