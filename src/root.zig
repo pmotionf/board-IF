@@ -110,9 +110,13 @@ pub fn process(
     }
 }
 
-/// Close ethercat connection. Calling this triggers the `process` thread to
-/// exit.
+/// Close ethercat connection.
 pub fn close(self: *@This()) void {
+    // Put all slaves to INIT state before closing the socket
+    self.ctx.slavelist[0].state = soem.EC_STATE_INIT;
+    _ = soem.ecx_writestate(self.ctx, 0);
+    checkSlaveState(self.ctx, soem.EC_STATE_INIT);
+    // Close the socket connection
     soem.ecx_close(self.ctx);
 }
 
