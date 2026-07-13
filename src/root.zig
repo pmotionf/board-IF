@@ -35,7 +35,6 @@ pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
 /// operational state. User must spawn a `process` thread for exhanging
 /// information to all slaves to ensure the slave's watchdogs is not triggered.
 pub fn open(self: *@This()) !void {
-    self.ctx = std.mem.zeroInit(soem.ecx_contextt, .{});
     if (soem.ecx_init(&self.ctx, self.ifname.ptr) <= 0) {
         return error.SoemInitializationFailed;
     }
@@ -64,9 +63,13 @@ pub fn open(self: *@This()) !void {
     // Wait until all slaves are in SAFE_OP state.
     checkSlaveState(&self.ctx, soem.EC_STATE_SAFE_OP);
     // Ensure slaves have valid output
-    if (soem.ecx_send_processdata(&self.ctx) != self.expected_wkc or
-        soem.ecx_receive_processdata(&self.ctx, soem.EC_TIMEOUTRET) != self.expected_wkc)
-    {
+    _ = soem.ecx_send_processdata(&self.ctx);
+    const receive_wkc = soem.ecx_receive_processdata(&self.ctx, soem.EC_TIMEOUTRET);
+    if (receive_wkc != self.expected_wkc) {
+        std.log.debug(
+            "expected wkc: {} -- actual wkc: {}",
+            .{ self.expected_wkc, receive_wkc },
+        );
         return error.InvalidWorkCounter;
     }
     std.log.debug("Connected to ethercat", .{});
@@ -87,18 +90,16 @@ pub fn process(
     // Asks the slaves to be in operational state
     board.ctx.slavelist[0].state = soem.EC_STATE_OPERATIONAL;
     _ = soem.ecx_writestate(&board.ctx, 0);
-    // Ensuring all slaves reach operational state
-    while (true) {
-        try io.checkCancel();
-        if (soem.ecx_readstate(&board.ctx) == soem.EC_STATE_OPERATIONAL) break;
-    }
+    checkSlaveState(&board.ctx, soem.EC_STATE_OPERATIONAL);
+    // Update all slaves state
+    _ = soem.ecx_readstate(&board.ctx);
     var timestamp: std.Io.Timestamp = .now(io, .real);
     const update_rate_us = 1000;
     while (true) {
+        _ = soem.ecx_readstate(&board.ctx);
         try board.lock.lock(io);
-        if (soem.ecx_send_processdata(&board.ctx) != board.expected_wkc or
-            soem.ecx_receive_processdata(&board.ctx, soem.EC_TIMEOUTRET) != board.expected_wkc)
-        {
+        _ = soem.ecx_send_processdata(&board.ctx);
+        if (soem.ecx_receive_processdata(&board.ctx, soem.EC_TIMEOUTRET) != board.expected_wkc) {
             return error.InvalidWorkCounter;
         }
         board.lock.unlock(io);
@@ -116,8 +117,6 @@ pub fn close(self: *@This()) void {
 /// Check whether all slaves already in the specified state
 fn checkSlaveState(ctx: *soem.ecx_contextt, state: u16) void {
     const slave_state: SlaveState = @enumFromInt(state);
-    ctx.slavelist[0].state = state;
-    _ = soem.ecx_writestate(ctx, 0);
     _ = soem.ecx_statecheck(ctx, 0, state, soem.EC_TIMEOUTSTATE * 4);
     if (ctx.slavelist[0].state != state) {
         std.log.warn("Not all slave enter {t} state", .{slave_state});
