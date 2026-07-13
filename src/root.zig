@@ -44,10 +44,16 @@ pub fn open(self: *@This()) !void {
     errdefer soem.ecx_close(self.ctx);
     // Wait until all slaves are in INIT state.
     checkSlaveState(self.ctx, soem.EC_STATE_INIT);
+    if (self.ctx.slavelist[0].state != soem.EC_STATE_INIT) {
+        return error.FailedToReachInitState;
+    }
     const stations: usize = @intCast(soem.ecx_config_init(self.ctx));
     if (stations <= 0) return error.NoSlavesFound;
     // Wait until all slaves are in PRE_OP state.
     checkSlaveState(self.ctx, soem.EC_STATE_PRE_OP);
+    if (self.ctx.slavelist[0].state != soem.EC_STATE_PRE_OP) {
+        return error.FailedToReachPreOperationalState;
+    }
     // Configure SM2 and SM3 for each slaves. This is a bug in the firmware
     // that the SM for PDO mapping is not configured correctly.
     for (self.ctx.slavelist[1 .. @as(usize, @intCast(self.ctx.slavecount)) + 1]) |*slave| {
@@ -65,6 +71,9 @@ pub fn open(self: *@This()) !void {
         self.ctx.grouplist[0].outputsWKC * 2 + self.ctx.grouplist[0].inputsWKC;
     // Wait until all slaves are in SAFE_OP state.
     checkSlaveState(self.ctx, soem.EC_STATE_SAFE_OP);
+    if (self.ctx.slavelist[0].state != soem.EC_STATE_SAFE_OP) {
+        return error.FailedToReachSafeOperationalState;
+    }
     // Ensure slaves have valid output
     _ = soem.ecx_send_processdata(self.ctx);
     const receive_wkc = soem.ecx_receive_processdata(self.ctx, soem.EC_TIMEOUTRET);
@@ -135,7 +144,8 @@ fn checkSlaveState(ctx: *soem.ecx_contextt, state: u16) void {
     if (ctx.slavelist[0].state != state) {
         std.log.warn("Not all slave enter {t} state", .{slave_state});
         _ = soem.ecx_readstate(ctx);
-        for (ctx.slavelist[1 .. @as(usize, @intCast(ctx.slavecount)) + 1]) |slave| {
+        std.log.debug("slave count {}", .{ctx.slavecount});
+        for (ctx.slavelist[1..@as(usize, @intCast(ctx.slavecount + 1))]) |slave| {
             std.log.warn(
                 "slave state: {t}, AL code: {t}",
                 .{
