@@ -120,6 +120,13 @@ pub fn close(self: *@This()) void {
     soem.ecx_close(self.ctx);
 }
 
+/// Switch all slaves state
+pub fn switchState(self: *@This(), state: u16) void {
+    self.ctx.slavelist[0].state = state;
+    _ = soem.ecx_writestate(self.ctx, 0);
+    checkSlaveState(self.ctx, state);
+}
+
 /// Check whether all slaves already in the specified state
 fn checkSlaveState(ctx: *soem.ecx_contextt, state: u16) void {
     const slave_state: SlaveState = @enumFromInt(state);
