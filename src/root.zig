@@ -5,20 +5,22 @@ pub const soem = @import("soem");
 io_map: []u8,
 ifname: []u8,
 ctx: *soem.ecx_contextt,
-lock: std.Io.RwLock,
+lock: *std.Io.RwLock,
 expected_wkc: u16,
 
 /// Allocate required memory for establishing ethercat connection.
 pub fn init(gpa: std.mem.Allocator, ifname: []const u8) !@This() {
     var res: @This() = .{
         .ctx = undefined,
-        .lock = .init,
+        .lock = undefined,
         .io_map = &.{},
         .ifname = &.{},
         .expected_wkc = 0,
     };
     errdefer res.deinit(gpa);
     res.ctx = try gpa.create(soem.ecx_contextt);
+    res.lock = try gpa.create(std.Io.RwLock);
+    res.lock.* = .init;
     res.ctx.* = std.mem.zeroInit(soem.ecx_contextt, .{});
     // TODO: Find a way to calculate required memory before even initializing connectioni to ethercat
     res.io_map = try gpa.alloc(u8, 4096);
@@ -30,6 +32,7 @@ pub fn init(gpa: std.mem.Allocator, ifname: []const u8) !@This() {
 pub fn deinit(self: @This(), gpa: std.mem.Allocator) void {
     soem.ecx_close(self.ctx);
     gpa.destroy(self.ctx);
+    gpa.destroy(self.lock);
     gpa.free(self.ifname);
     gpa.free(self.io_map);
 }
@@ -37,20 +40,20 @@ pub fn deinit(self: @This(), gpa: std.mem.Allocator) void {
 /// Establish ethercat connection and ensure all slaves are in safe
 /// operational state. User must spawn a `process` thread for exhanging
 /// information to all slaves to ensure the slave's watchdogs is not triggered.
-pub fn open(self: *@This()) !void {
+pub fn open(self: *@This(), io: std.Io) !void {
     if (soem.ecx_init(self.ctx, self.ifname.ptr) <= 0) {
         return error.SoemInitializationFailed;
     }
     errdefer soem.ecx_close(self.ctx);
     // Wait until all slaves are in INIT state.
-    checkSlaveState(self.ctx, soem.EC_STATE_INIT);
+    try waitSlaveState(io, self.ctx, soem.EC_STATE_INIT);
     if (self.ctx.slavelist[0].state != soem.EC_STATE_INIT) {
         return error.FailedToReachInitState;
     }
     const stations: usize = @intCast(soem.ecx_config_init(self.ctx));
     if (stations <= 0) return error.NoSlavesFound;
     // Wait until all slaves are in PRE_OP state.
-    checkSlaveState(self.ctx, soem.EC_STATE_PRE_OP);
+    try waitSlaveState(io, self.ctx, soem.EC_STATE_PRE_OP);
     if (self.ctx.slavelist[0].state != soem.EC_STATE_PRE_OP) {
         return error.FailedToReachPreOperationalState;
     }
@@ -70,7 +73,7 @@ pub fn open(self: *@This()) !void {
     self.expected_wkc =
         self.ctx.grouplist[0].outputsWKC * 2 + self.ctx.grouplist[0].inputsWKC;
     // Wait until all slaves are in SAFE_OP state.
-    checkSlaveState(self.ctx, soem.EC_STATE_SAFE_OP);
+    try waitSlaveState(io, self.ctx, soem.EC_STATE_SAFE_OP);
     if (self.ctx.slavelist[0].state != soem.EC_STATE_SAFE_OP) {
         return error.FailedToReachSafeOperationalState;
     }
@@ -93,16 +96,20 @@ pub fn open(self: *@This()) !void {
 pub fn process(
     io: std.Io,
     board: *@This(),
-) (std.Io.Cancelable || error{InvalidWorkCounter})!void {
+) (std.Io.Cancelable || error{ InvalidWorkCounter, SlaveError })!void {
     defer {
         if (@errorReturnTrace()) |error_trace| {
             std.debug.dumpErrorReturnTrace(error_trace);
         }
     }
+    // Ensuring all slaves already in safe operational state
+    while (board.ctx.slavelist[0].state != soem.EC_STATE_SAFE_OP) {
+        try io.checkCancel();
+    }
     // Asks the slaves to be in operational state
     board.ctx.slavelist[0].state = soem.EC_STATE_OPERATIONAL;
     _ = soem.ecx_writestate(board.ctx, 0);
-    checkSlaveState(board.ctx, soem.EC_STATE_OPERATIONAL);
+    try waitSlaveState(io, board.ctx, soem.EC_STATE_OPERATIONAL);
     // Update all slaves state
     _ = soem.ecx_readstate(board.ctx);
     var timestamp: std.Io.Timestamp = .now(io, .real);
@@ -118,45 +125,52 @@ pub fn process(
         const current = timestamp.untilNow(io, .real).toMicroseconds();
         try io.sleep(.fromMicroseconds(update_rate_us - current), .real);
     }
+    std.log.debug("Process thread exiting...", .{});
 }
 
 /// Close ethercat connection.
-pub fn close(self: *@This()) void {
+pub fn close(self: *@This(), io: std.Io) !void {
     // Put all slaves to INIT state before closing the socket
     self.ctx.slavelist[0].state = soem.EC_STATE_INIT;
     _ = soem.ecx_writestate(self.ctx, 0);
-    checkSlaveState(self.ctx, soem.EC_STATE_INIT);
+    try waitSlaveState(io, self.ctx, soem.EC_STATE_INIT);
     // Close the socket connection
     soem.ecx_close(self.ctx);
 }
 
 /// Switch all slaves state
-pub fn switchState(self: *@This(), state: u16) void {
+pub fn switchState(self: *@This(), io: std.Io, state: u16) (std.Io.Cancelable || error{SlaveError})!void {
     self.ctx.slavelist[0].state = state;
     _ = soem.ecx_writestate(self.ctx, 0);
-    checkSlaveState(self.ctx, state);
+    try waitSlaveState(io, self.ctx, state);
 }
 
-/// Check whether all slaves already in the specified state.
-fn checkSlaveState(ctx: *soem.ecx_contextt, state: u16) void {
-    const slave_state: SlaveState = @enumFromInt(state);
-    _ = soem.ecx_statecheck(ctx, 0, state, soem.EC_TIMEOUTSTATE * 4);
-    if (ctx.slavelist[0].state != state) {
-        std.log.warn("Not all slave enter {t} state", .{slave_state});
+/// Ensure all slaves already in the specified state. Return error if one of
+/// the slaves in error state
+fn waitSlaveState(
+    io: std.Io,
+    ctx: *soem.ecx_contextt,
+    state: u16,
+) (std.Io.Cancelable || error{SlaveError})!void {
+    const slaves = ctx.slavelist[1..@as(usize, @intCast(ctx.slavecount + 1))];
+    while (ctx.slavelist[0].state != state) {
+        try io.checkCancel();
         _ = soem.ecx_readstate(ctx);
-        std.log.debug("slave count {}", .{ctx.slavecount});
-        for (ctx.slavelist[1..@as(usize, @intCast(ctx.slavecount + 1))]) |slave| {
-            std.log.warn(
-                "slave state: {t}, AL code: {t}",
-                .{
-                    @as(SlaveState, @enumFromInt(slave.state)),
-                    @as(ALStatusCode, @enumFromInt(slave.ALstatuscode)),
-                },
-            );
+        for (slaves, 1..) |slave, id| {
+            if (slave.state > state) {
+                std.log.err(
+                    "Slave {} AL status code: {t}",
+                    .{ id, @as(ALStatusCode, @enumFromInt(slave.ALstatuscode)) },
+                );
+                return error.SlaveError;
+            }
         }
-    } else {
-        std.log.debug("All slaves enter {t}", .{slave_state});
     }
+    std.log.debug("state: {} -- expected: {}", .{ ctx.slavelist[0].state, state });
+    std.log.debug(
+        "All slaves enter {t}",
+        .{@as(SlaveState, @enumFromInt(state))},
+    );
 }
 
 /// Wrapper for SOEM functions that may return error code.
