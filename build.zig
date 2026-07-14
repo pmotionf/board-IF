@@ -9,7 +9,7 @@ pub fn build(b: *std.Build) !void {
         else => return error.UnsupportedOs,
     }
     const translate_c = b.dependency("translate_c", .{
-        .target = target,
+        .target = b.graph.host,
         .optimize = optimize,
     });
 
