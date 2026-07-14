@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .soem = .{
-            .url = "git+https://github.com/aaumar25/SOEM.git#51364cb57f5bfe40ce1ff8f4f9ed5a0c7de95221",
-            .hash = "soem-2.0.0-XrzE9AouAAB3AG1xfMRHxwDrppnhsfJ0pMEEqAMHV4vI",
+            .url = "git+https://github.com/aaumar25/SOEM.git#9284a981b9c32be56a3e91efd69c7b4e1fd63b01",
+            .hash = "soem-2.0.0-XrzE9Cc0AAAvysr3NzYvJcZsFqrxxdw6mDw9wq08j0c7",
         },
         .translate_c = .{
             .url = "git+https://codeberg.org/ziglang/translate-c?ref=zig-0.16.x#6fe0ffc4549f15c5f2d9432c2b4460ba90ff85ac",

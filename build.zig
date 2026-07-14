@@ -34,6 +34,11 @@ pub fn build(b: *std.Build) !void {
     });
     mod.addImport("soem", trans_soem.mod);
 
+    // Workaround for wpcap library bundled in soem
+    if (target.result.os.tag == .windows) {
+        mod.addLibraryPath(soem.namedLazyPath("wpcap_lib_dir"));
+    }
+
     const mod_tests = b.addTest(.{
         .root_module = mod,
     });
