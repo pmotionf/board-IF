@@ -37,10 +37,11 @@ const Adapter = struct {
 
     fn enqueueContext(
         io: std.Io,
+        gpa: std.mem.Allocator,
         adapter: Adapter,
-        results: *std.Io.Queue((Error || std.Io.Cancelable)!soem.ecx_contextt),
+        results: *std.Io.Queue(InitResults),
     ) std.Io.Cancelable!void {
-        const ctx = getContext(io, adapter.name);
+        const ctx = getContext(io, gpa, adapter.name);
         results.putOne(io, ctx) catch |err| switch (err) {
             error.Canceled => |e| return e,
             error.Closed => unreachable, // `queue` must not be closed
@@ -49,17 +50,22 @@ const Adapter = struct {
 
     fn getContext(
         io: std.Io,
+        gpa: std.mem.Allocator,
         ifname: [128]u8,
-    ) (Error || std.Io.Cancelable)!soem.ecx_contextt {
-        var ctx = std.mem.zeroInit(soem.ecx_contextt, .{});
-        if (soem.ecx_init(&ctx, &ifname) <= 0) {
+    ) InitResults {
+        // Initializing soem without the pointer may leave dangling pointer
+        // problem.
+        const ctx = try gpa.create(soem.ecx_contextt);
+        ctx.* = std.mem.zeroInit(soem.ecx_contextt, .{});
+        errdefer gpa.destroy(ctx);
+        if (soem.ecx_init(ctx, &ifname) <= 0) {
             return error.AccessDenied;
         }
-        errdefer soem.ecx_close(&ctx);
-        const stations: isize = @intCast(soem.ecx_config_init(&ctx));
+        errdefer soem.ecx_close(ctx);
+        const stations: isize = @intCast(soem.ecx_config_init(ctx));
         if (stations <= 0) return error.NoSlavesFound;
         // Wait until all slaves are in PRE_OP state.
-        try waitSlaveState(io, &ctx, soem.EC_STATE_PRE_OP);
+        try waitSlaveState(io, ctx, soem.EC_STATE_PRE_OP);
         if (ctx.slavelist[0].state != soem.EC_STATE_PRE_OP) {
             return error.FailedToReachPreOperationalState;
         }
@@ -72,6 +78,7 @@ const Adapter = struct {
     /// Closes results before return, even on error.
     fn initMany(
         io: std.Io,
+        gpa: std.mem.Allocator,
         results: *std.Io.Queue(InitResults),
     ) std.Io.Cancelable!void {
         defer results.close(io);
@@ -86,7 +93,7 @@ const Adapter = struct {
             group.async(
                 io,
                 Adapter.enqueueContext,
-                .{ io, adapter, results },
+                .{ io, gpa, adapter, results },
             );
         } else |err| switch (err) {
             error.Canceled => |e| return e,
@@ -98,20 +105,19 @@ const Adapter = struct {
     }
 
     /// Initialize ethercat connection for all available interfaces.
-    fn init(io: std.Io) InitResults {
+    fn init(io: std.Io, gpa: std.mem.Allocator) InitResults {
         var init_many_buffer: [16]InitResults = undefined;
         var init_many_queue: std.Io.Queue(InitResults) =
             .init(&init_many_buffer);
         var init_many = io.async(
             initMany,
-            .{ io, &init_many_queue },
+            .{ io, gpa, &init_many_queue },
         );
         defer {
             init_many.cancel(io) catch {};
             while (init_many_queue.getOneUncancelable(io)) |ctx| {
                 if (ctx) |c| {
-                    var soem_ctx: soem.ecx_contextt = c;
-                    soem.ecx_close(&soem_ctx);
+                    soem.ecx_close(c);
                 } else |_| {}
             } else |_| {}
         }
@@ -129,7 +135,7 @@ const Adapter = struct {
         }
     }
 
-    const InitResults = (Adapter.Error || std.Io.Cancelable)!soem.ecx_contextt;
+    const InitResults = (Adapter.Error || std.Io.Cancelable)!*soem.ecx_contextt;
     const Error = error{
         AccessDenied,
         FailedToReachInitState,
@@ -137,6 +143,7 @@ const Adapter = struct {
         NoSlavesFound,
         SlaveError,
         EthercatSocketNotFound,
+        OutOfMemory,
     };
 };
 
@@ -148,11 +155,9 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io) !@This() {
         .io_map = &.{},
         .expected_wkc = 0,
     };
-    const ctx = try Adapter.init(io);
-    res.ctx = try gpa.create(soem.ecx_contextt);
-    res.ctx.* = ctx;
-    errdefer res.deinit(gpa);
+    res.ctx = try Adapter.init(io, gpa);
     res.lock = try gpa.create(std.Io.RwLock);
+    errdefer res.deinit(gpa);
     res.lock.* = .init;
     // TODO: Find a way to calculate required memory before even initializing connectioni to ethercat
     res.io_map = try gpa.alloc(u8, 4096);
