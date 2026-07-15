@@ -176,6 +176,15 @@ pub fn deinit(self: @This(), gpa: std.mem.Allocator) void {
 /// operational state. User must spawn a `process` thread for exhanging
 /// information to all slaves to ensure the slave's watchdogs is not triggered.
 pub fn open(self: *@This(), io: std.Io) !void {
+    if (self.ctx.slavelist[0].state != soem.EC_STATE_PRE_OP) {
+        const stations: isize = @intCast(soem.ecx_config_init(self.ctx));
+        if (stations <= 0) return error.NoSlavesFound;
+        // Wait until all slaves are in PRE_OP state.
+        try waitSlaveState(io, self.ctx, soem.EC_STATE_PRE_OP);
+        if (self.ctx.slavelist[0].state != soem.EC_STATE_PRE_OP) {
+            return error.FailedToReachPreOperationalState;
+        }
+    }
     // Configure SM2 and SM3 for each slaves. This is a bug in the firmware
     // that the SM for PDO mapping is not configured correctly.
     for (self.ctx.slavelist[1 .. @as(usize, @intCast(self.ctx.slavecount)) + 1]) |*slave| {
