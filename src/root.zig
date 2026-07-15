@@ -225,11 +225,6 @@ pub fn process(
     io: std.Io,
     board: *@This(),
 ) (std.Io.Cancelable || error{ InvalidWorkCounter, SlaveError })!void {
-    defer {
-        if (@errorReturnTrace()) |error_trace| {
-            std.debug.dumpErrorReturnTrace(error_trace);
-        }
-    }
     // Ensuring all slaves already in safe operational state
     while (board.ctx.slavelist[0].state != soem.EC_STATE_SAFE_OP) {
         try io.checkCancel();
@@ -244,16 +239,17 @@ pub fn process(
     const update_rate_us = 1000;
     while (true) {
         _ = soem.ecx_readstate(board.ctx);
-        try board.lock.lock(io);
-        _ = soem.ecx_send_processdata(board.ctx);
-        if (soem.ecx_receive_processdata(board.ctx, soem.EC_TIMEOUTRET) != board.expected_wkc) {
-            return error.InvalidWorkCounter;
+        {
+            try board.lock.lock(io);
+            defer board.lock.unlock(io);
+            _ = soem.ecx_send_processdata(board.ctx);
+            if (soem.ecx_receive_processdata(board.ctx, soem.EC_TIMEOUTRET) != board.expected_wkc) {
+                return error.InvalidWorkCounter;
+            }
         }
-        board.lock.unlock(io);
         const current = timestamp.untilNow(io, .real).toMicroseconds();
         try io.sleep(.fromMicroseconds(update_rate_us - current), .real);
     }
-    std.log.debug("Process thread exiting...", .{});
 }
 
 /// Close ethercat connection.
