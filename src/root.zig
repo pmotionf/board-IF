@@ -56,12 +56,7 @@ const Adapter = struct {
             return error.AccessDenied;
         }
         errdefer soem.ecx_close(&ctx);
-        // Wait until all slaves are in INIT state.
-        try waitSlaveState(io, &ctx, soem.EC_STATE_INIT);
-        if (ctx.slavelist[0].state != soem.EC_STATE_INIT) {
-            return error.FailedToReachInitState;
-        }
-        const stations: usize = @intCast(soem.ecx_config_init(&ctx));
+        const stations: isize = @intCast(soem.ecx_config_init(&ctx));
         if (stations <= 0) return error.NoSlavesFound;
         // Wait until all slaves are in PRE_OP state.
         try waitSlaveState(io, &ctx, soem.EC_STATE_PRE_OP);
