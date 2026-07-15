@@ -276,7 +276,7 @@ fn waitSlaveState(
         try io.checkCancel();
         _ = soem.ecx_readstate(ctx);
         for (slaves, 1..) |slave, id| {
-            if (slave.state > state) {
+            if (slave.state > soem.EC_STATE_ERROR) {
                 std.log.err(
                     "Slave {} AL status code: {t}",
                     .{ id, @as(ALStatusCode, @enumFromInt(slave.ALstatuscode)) },
