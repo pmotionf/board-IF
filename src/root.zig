@@ -80,7 +80,7 @@ const Adapter = struct {
         results: *std.Io.Queue(InitResults),
     ) std.Io.Cancelable!void {
         defer results.close(io);
-        var adapter_buffer: [64]Adapter = undefined;
+        var adapter_buffer: [16]Adapter = undefined;
         var adapter_queue: std.Io.Queue(Adapter) = .init(&adapter_buffer);
         var adapter_future = io.async(Adapter.lookup, .{ io, &adapter_queue });
         defer adapter_future.cancel(io) catch {};
@@ -104,7 +104,7 @@ const Adapter = struct {
 
     /// Initialize ethercat connection for all available interfaces.
     fn init(io: std.Io) InitResults {
-        var init_many_buffer: [64]InitResults = undefined;
+        var init_many_buffer: [16]InitResults = undefined;
         var init_many_queue: std.Io.Queue(InitResults) =
             .init(&init_many_buffer);
         var init_many = io.async(
