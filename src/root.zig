@@ -15,17 +15,24 @@ const Adapter = struct {
         io: std.Io,
         queue: *std.Io.Queue(Adapter),
     ) std.Io.Cancelable!void {
+        defer queue.close(io);
         const adapters = soem.ec_find_adapters();
-        while (adapters != null) {
-            const adapter: Adapter = .{
-                .name = adapters.*.name,
-                .desc = adapters.*.desc,
-            };
-            queue.putOne(io, adapter) catch |err| switch (err) {
+        var adapter = if (adapters == null)
+            return
+        else
+            adapters.*;
+        while (true) {
+            queue.putOne(io, .{
+                .name = adapter.name,
+                .desc = adapter.desc,
+            }) catch |err| switch (err) {
                 error.Canceled => |e| return e,
                 error.Closed => unreachable, // `queue` must not be closed
             };
+            if (adapter.next == null) break;
+            adapter = adapter.next.*;
         }
+        soem.ec_free_adapters(adapters);
     }
 
     fn enqueueContext(
@@ -77,9 +84,6 @@ const Adapter = struct {
         var adapter_queue: std.Io.Queue(Adapter) = .init(&adapter_buffer);
         var adapter_future = io.async(Adapter.lookup, .{ io, &adapter_queue });
         defer adapter_future.cancel(io) catch {};
-        const Interface = (Adapter.Error || std.Io.Cancelable)!soem.ecx_contextt;
-        var interface_buffer: [64]Interface = undefined;
-        var interface_queue: std.Io.Queue(Interface) = .init(&interface_buffer);
         // Asynchronously initialize all slaves to find valid ethercat slaves.
         var group: std.Io.Group = .init;
         defer group.cancel(io);
@@ -87,7 +91,7 @@ const Adapter = struct {
             group.async(
                 io,
                 Adapter.enqueueContext,
-                .{ io, adapter, &interface_queue },
+                .{ io, adapter, results },
             );
         } else |err| switch (err) {
             error.Canceled => |e| return e,
@@ -103,7 +107,10 @@ const Adapter = struct {
         var init_many_buffer: [64]InitResults = undefined;
         var init_many_queue: std.Io.Queue(InitResults) =
             .init(&init_many_buffer);
-        var init_many = io.async(initMany, .{ io, &init_many_queue });
+        var init_many = io.async(
+            initMany,
+            .{ io, &init_many_queue },
+        );
         defer {
             init_many.cancel(io) catch {};
             while (init_many_queue.getOneUncancelable(io)) |ctx| {
@@ -146,11 +153,11 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io) !@This() {
         .io_map = &.{},
         .expected_wkc = 0,
     };
-    errdefer res.deinit(gpa);
     const ctx = try Adapter.init(io);
     res.ctx = try gpa.create(soem.ecx_contextt);
-    res.lock = try gpa.create(std.Io.RwLock);
     res.ctx.* = ctx;
+    errdefer res.deinit(gpa);
+    res.lock = try gpa.create(std.Io.RwLock);
     res.lock.* = .init;
     // TODO: Find a way to calculate required memory before even initializing connectioni to ethercat
     res.io_map = try gpa.alloc(u8, 4096);
@@ -429,4 +436,11 @@ pub const ALStatusCode = enum(u16) {
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "Init" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const board = try init(gpa, io);
+    board.deinit(gpa);
 }
