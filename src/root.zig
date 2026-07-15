@@ -164,9 +164,9 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io) !@This() {
     return res;
 }
 
-/// Close and free all allocated memory for ethercat interface.
+/// Free all allocated memory for ethercat interface. Caller must 
+/// ensure to close the socket before destroying the soem context.
 pub fn deinit(self: @This(), gpa: std.mem.Allocator) void {
-    soem.ecx_close(self.ctx);
     gpa.destroy(self.ctx);
     gpa.destroy(self.lock);
     gpa.free(self.io_map);
