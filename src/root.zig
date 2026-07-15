@@ -3,28 +3,157 @@ const std = @import("std");
 pub const soem = @import("soem");
 
 io_map: []u8,
-ifname: []u8,
 ctx: *soem.ecx_contextt,
 lock: *std.Io.RwLock,
 expected_wkc: u16,
 
+const Adapter = struct {
+    name: [128]u8,
+    desc: [128]u8,
+
+    fn lookup(
+        io: std.Io,
+        queue: *std.Io.Queue(Adapter),
+    ) std.Io.Cancelable!void {
+        const adapters = soem.ec_find_adapters();
+        while (adapters != null) {
+            const adapter: Adapter = .{
+                .name = adapters.*.name,
+                .desc = adapters.*.desc,
+            };
+            queue.putOne(io, adapter) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                error.Closed => unreachable, // `queue` must not be closed
+            };
+        }
+    }
+
+    fn enqueueContext(
+        io: std.Io,
+        adapter: Adapter,
+        results: *std.Io.Queue((Error || std.Io.Cancelable)!soem.ecx_contextt),
+    ) std.Io.Cancelable!void {
+        const ctx = getContext(io, adapter.name);
+        results.putOne(io, ctx) catch |err| switch (err) {
+            error.Canceled => |e| return e,
+            error.Closed => unreachable, // `queue` must not be closed
+        };
+    }
+
+    fn getContext(
+        io: std.Io,
+        ifname: [128]u8,
+    ) (Error || std.Io.Cancelable)!soem.ecx_contextt {
+        var ctx = std.mem.zeroInit(soem.ecx_contextt, .{});
+        if (soem.ecx_init(&ctx, &ifname) <= 0) {
+            return error.AccessDenied;
+        }
+        errdefer soem.ecx_close(&ctx);
+        // Wait until all slaves are in INIT state.
+        try waitSlaveState(io, &ctx, soem.EC_STATE_INIT);
+        if (ctx.slavelist[0].state != soem.EC_STATE_INIT) {
+            return error.FailedToReachInitState;
+        }
+        const stations: usize = @intCast(soem.ecx_config_init(&ctx));
+        if (stations <= 0) return error.NoSlavesFound;
+        // Wait until all slaves are in PRE_OP state.
+        try waitSlaveState(io, &ctx, soem.EC_STATE_PRE_OP);
+        if (ctx.slavelist[0].state != soem.EC_STATE_PRE_OP) {
+            return error.FailedToReachPreOperationalState;
+        }
+        return ctx;
+    }
+
+    /// Asynchronously initialize all available network interface for ethercat
+    /// protocol, adding them to results upon completion.
+    ///
+    /// Closes results before return, even on error.
+    fn initMany(
+        io: std.Io,
+        results: *std.Io.Queue(InitResults),
+    ) std.Io.Cancelable!void {
+        defer results.close(io);
+        var adapter_buffer: [64]Adapter = undefined;
+        var adapter_queue: std.Io.Queue(Adapter) = .init(&adapter_buffer);
+        var adapter_future = io.async(Adapter.lookup, .{ io, &adapter_queue });
+        defer adapter_future.cancel(io) catch {};
+        const Interface = (Adapter.Error || std.Io.Cancelable)!soem.ecx_contextt;
+        var interface_buffer: [64]Interface = undefined;
+        var interface_queue: std.Io.Queue(Interface) = .init(&interface_buffer);
+        // Asynchronously initialize all slaves to find valid ethercat slaves.
+        var group: std.Io.Group = .init;
+        defer group.cancel(io);
+        while (adapter_queue.getOne(io)) |adapter| {
+            group.async(
+                io,
+                Adapter.enqueueContext,
+                .{ io, adapter, &interface_queue },
+            );
+        } else |err| switch (err) {
+            error.Canceled => |e| return e,
+            error.Closed => {
+                try group.await(io);
+                try adapter_future.await(io);
+            },
+        }
+    }
+
+    /// Initialize ethercat connection for all available interfaces.
+    fn init(io: std.Io) InitResults {
+        var init_many_buffer: [64]InitResults = undefined;
+        var init_many_queue: std.Io.Queue(InitResults) =
+            .init(&init_many_buffer);
+        var init_many = io.async(initMany, .{ io, &init_many_queue });
+        defer {
+            init_many.cancel(io) catch {};
+            while (init_many_queue.getOneUncancelable(io)) |ctx| {
+                if (ctx) |c| {
+                    var soem_ctx: soem.ecx_contextt = c;
+                    soem.ecx_close(&soem_ctx);
+                } else |_| {}
+            } else |_| {}
+        }
+        var init_error: ?Error = null;
+        while (init_many_queue.getOne(io)) |result| {
+            if (result) |ctx| {
+                return ctx;
+            } else |err| switch (err) {
+                error.Canceled => unreachable,
+                else => |e| init_error = e,
+            }
+        } else |err| switch (err) {
+            error.Canceled => |e| return e,
+            error.Closed => return error.EthercatSocketNotFound,
+        }
+    }
+
+    const InitResults = (Adapter.Error || std.Io.Cancelable)!soem.ecx_contextt;
+    const Error = error{
+        AccessDenied,
+        FailedToReachInitState,
+        FailedToReachPreOperationalState,
+        NoSlavesFound,
+        SlaveError,
+        EthercatSocketNotFound,
+    };
+};
+
 /// Allocate required memory for establishing ethercat connection.
-pub fn init(gpa: std.mem.Allocator, ifname: []const u8) !@This() {
+pub fn init(gpa: std.mem.Allocator, io: std.Io) !@This() {
     var res: @This() = .{
         .ctx = undefined,
         .lock = undefined,
         .io_map = &.{},
-        .ifname = &.{},
         .expected_wkc = 0,
     };
     errdefer res.deinit(gpa);
+    const ctx = try Adapter.init(io);
     res.ctx = try gpa.create(soem.ecx_contextt);
     res.lock = try gpa.create(std.Io.RwLock);
+    res.ctx.* = ctx;
     res.lock.* = .init;
-    res.ctx.* = std.mem.zeroInit(soem.ecx_contextt, .{});
     // TODO: Find a way to calculate required memory before even initializing connectioni to ethercat
     res.io_map = try gpa.alloc(u8, 4096);
-    res.ifname = try gpa.dupe(u8, ifname);
     return res;
 }
 
@@ -33,7 +162,6 @@ pub fn deinit(self: @This(), gpa: std.mem.Allocator) void {
     soem.ecx_close(self.ctx);
     gpa.destroy(self.ctx);
     gpa.destroy(self.lock);
-    gpa.free(self.ifname);
     gpa.free(self.io_map);
 }
 
@@ -41,22 +169,6 @@ pub fn deinit(self: @This(), gpa: std.mem.Allocator) void {
 /// operational state. User must spawn a `process` thread for exhanging
 /// information to all slaves to ensure the slave's watchdogs is not triggered.
 pub fn open(self: *@This(), io: std.Io) !void {
-    if (soem.ecx_init(self.ctx, self.ifname.ptr) <= 0) {
-        return error.SoemInitializationFailed;
-    }
-    errdefer soem.ecx_close(self.ctx);
-    // Wait until all slaves are in INIT state.
-    try waitSlaveState(io, self.ctx, soem.EC_STATE_INIT);
-    if (self.ctx.slavelist[0].state != soem.EC_STATE_INIT) {
-        return error.FailedToReachInitState;
-    }
-    const stations: usize = @intCast(soem.ecx_config_init(self.ctx));
-    if (stations <= 0) return error.NoSlavesFound;
-    // Wait until all slaves are in PRE_OP state.
-    try waitSlaveState(io, self.ctx, soem.EC_STATE_PRE_OP);
-    if (self.ctx.slavelist[0].state != soem.EC_STATE_PRE_OP) {
-        return error.FailedToReachPreOperationalState;
-    }
     // Configure SM2 and SM3 for each slaves. This is a bug in the firmware
     // that the SM for PDO mapping is not configured correctly.
     for (self.ctx.slavelist[1 .. @as(usize, @intCast(self.ctx.slavecount)) + 1]) |*slave| {
