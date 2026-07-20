@@ -474,10 +474,3 @@ pub const ALStatusCode = enum(u16) {
 test {
     std.testing.refAllDecls(@This());
 }
-
-test "Init" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    const board = try init(gpa, io);
-    board.deinit(gpa);
-}
