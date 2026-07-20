@@ -31,8 +31,11 @@ pub fn build(b: *std.Build) !void {
     const mod = b.addModule("board-IF", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+        .link_libc = true,
     });
     mod.addImport("soem", trans_soem.mod);
+    mod.addCSourceFile(.{ .file = b.path("src/soem_shim.c") });
+    mod.linkLibrary(soem.artifact("soem"));
 
     // Workaround for wpcap library bundled in soem
     if (target.result.os.tag == .windows) {

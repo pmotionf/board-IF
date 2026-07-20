@@ -1,6 +1,9 @@
 //! By convention, root.zig is the root source file when making a package.
 const std = @import("std");
+
 pub const soem = @import("soem");
+
+const shim = @import("soem_shim.zig");
 
 io_map: []u8,
 ctx: *soem.ecx_contextt,
@@ -164,7 +167,7 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io) !@This() {
     return res;
 }
 
-/// Free all allocated memory for ethercat interface. Caller must 
+/// Free all allocated memory for ethercat interface. Caller must
 /// ensure to close the socket before destroying the soem context.
 pub fn deinit(self: @This(), gpa: std.mem.Allocator) void {
     gpa.destroy(self.ctx);
@@ -185,11 +188,24 @@ pub fn open(self: *@This(), io: std.Io) !void {
             return error.FailedToReachPreOperationalState;
         }
     }
-    // Configure SM2 and SM3 for each slaves. This is a bug in the firmware
-    // that the SM for PDO mapping is not configured correctly.
-    for (self.ctx.slavelist[1 .. @as(usize, @intCast(self.ctx.slavecount)) + 1]) |*slave| {
-        slave.SM[2] = .{ .StartAddr = 0x1100, .SMlength = 42, .SMflags = 0x64 };
-        slave.SM[3] = .{ .StartAddr = 0x1180, .SMlength = 44, .SMflags = 0x20 };
+    // Configure SM2 (outputs) and SM3 (inputs) for each slave right before
+    // ecx_config_map_group, matching the working Linux pattern -- that
+    // call builds the FMMU entries from whatever SM2/SM3 it reads at that
+    // moment, so this must happen before it, not after. SM0/SM1 (mailbox)
+    // are left as ecx_config_init already set them.
+    //
+    // This goes through soem_shim.c/shim_set_sm rather than a direct
+    // `slave.SM[...] = ...` field write: translate-c places ec_slavet.SM
+    // at the wrong byte offset on this build (a translate-c bug -- it
+    // doesn't propagate #pragma pack(push,1)'s effect on ec_smt's
+    // *exported alignment* into the containing, unpacked ec_slavet), so a
+    // direct field write lands 3+ bytes off from where the real SOEM C
+    // code (ecx_config_map_group, ecx_FPWR, ...) will actually read it.
+    // shim_set_sm is compiled against the real header, so it always uses
+    // the real ABI regardless of how translate-c misreads it.
+    for (1..@as(usize, @intCast(self.ctx.slavecount)) + 1) |i| {
+        shim.shim_set_sm(self.ctx, @intCast(i), 2, 0x1100, 40, 0x10064, 3); // Outputs
+        shim.shim_set_sm(self.ctx, @intCast(i), 3, 0x1400, 44, 0x10020, 4); // Inputs
     }
     const size = soem.ecx_config_map_group(
         self.ctx,
