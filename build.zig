@@ -1,4 +1,5 @@
 const std = @import("std");
+
 const Translator = @import("translate_c").Translator;
 
 pub fn build(b: *std.Build) !void {
@@ -16,6 +17,7 @@ pub fn build(b: *std.Build) !void {
     const soem = b.dependency("soem", .{
         .target = target,
         .optimize = optimize,
+        .EC_TIMEOUTRET = 1000,
     });
 
     const trans_soem: Translator = .init(translate_c, .{

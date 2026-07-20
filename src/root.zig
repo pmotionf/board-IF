@@ -9,6 +9,9 @@ io_map: []u8,
 ctx: *soem.ecx_contextt,
 lock: *std.Io.RwLock,
 expected_wkc: u16,
+exchanging: std.atomic.Value(bool),
+down_wkc_count: u8, // Detecting down time from the ethercat connection.
+// TODO: Replicate how SOEM ec_sample.c do with wkc down, and find out why.
 
 const Adapter = struct {
     name: [128]u8,
@@ -157,6 +160,8 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io) !@This() {
         .lock = undefined,
         .io_map = &.{},
         .expected_wkc = 0,
+        .exchanging = .init(false),
+        .down_wkc_count = 0,
     };
     res.ctx = try Adapter.init(io, gpa);
     res.lock = try gpa.create(std.Io.RwLock);
@@ -236,14 +241,14 @@ pub fn open(self: *@This(), io: std.Io) !void {
 
 /// Asks slaves to be in operational state and maintain process data exchange.
 /// This function must be called in its own thread to maintain the slaves state
-/// stays on OPERATIONAL state.
+/// stays on OPERATIONAL state. Terminated if `close()` is called.
 pub fn process(
     io: std.Io,
     board: *@This(),
-) (std.Io.Cancelable || error{ InvalidWorkCounter, SlaveError })!void {
+) (std.Io.Cancelable || error{SlaveError})!void {
     // Ensuring all slaves already in safe operational state
-    while (board.ctx.slavelist[0].state != soem.EC_STATE_SAFE_OP) {
-        try io.checkCancel();
+    if (board.ctx.slavelist[0].state != soem.EC_STATE_SAFE_OP) {
+        return error.SlaveError;
     }
     // Asks the slaves to be in operational state
     board.ctx.slavelist[0].state = soem.EC_STATE_OPERATIONAL;
@@ -252,24 +257,35 @@ pub fn process(
     // Update all slaves state
     _ = soem.ecx_readstate(board.ctx);
     var timestamp: std.Io.Timestamp = .now(io, .real);
-    const update_rate_us = 1000;
+    // Exchange update rate in microseconds. Exchange update rate must be greater
+    // than EC_TIMEOUTRET.
+    const update_rate_us = 3000;
+    board.exchanging.store(true, .monotonic);
     while (true) {
+        if (board.exchanging.load(.monotonic) == false) return;
         _ = soem.ecx_readstate(board.ctx);
         {
             try board.lock.lock(io);
             defer board.lock.unlock(io);
             _ = soem.ecx_send_processdata(board.ctx);
-            if (soem.ecx_receive_processdata(board.ctx, soem.EC_TIMEOUTRET) != board.expected_wkc) {
-                return error.InvalidWorkCounter;
-            }
+            const receive_wkc = soem.ecx_receive_processdata(board.ctx, soem.EC_TIMEOUTRET);
+            if (receive_wkc != board.expected_wkc) {
+                board.down_wkc_count += 1;
+                std.log.debug("invalid wkc counter: {}", .{board.down_wkc_count});
+            } else board.down_wkc_count = 0;
         }
         const current = timestamp.untilNow(io, .real).toMicroseconds();
-        try io.sleep(.fromMicroseconds(update_rate_us - current), .real);
+        // Sleep the process thread, but not allowing the thread to return on cancel.
+        io.sleep(.fromMicroseconds(update_rate_us - current), .real) catch {};
     }
 }
 
-/// Close ethercat connection.
+/// Close ethercat connection and terminate process thread if spawned.
 pub fn close(self: *@This(), io: std.Io) !void {
+    // Terminate the process thread
+    if (self.exchanging.load(.monotonic) == true) {
+        self.exchanging.store(false, .monotonic);
+    }
     // Put all slaves to INIT state before closing the socket
     self.ctx.slavelist[0].state = soem.EC_STATE_INIT;
     _ = soem.ecx_writestate(self.ctx, 0);
