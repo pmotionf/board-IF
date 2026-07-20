@@ -53,8 +53,15 @@ pub fn build(b: *std.Build) !void {
     // Building this library requires the wpcap bundled by SOEM
     if (target.result.os.tag == .windows) {
         const wpcap_lib: std.Build.LazyPath = .{ .cwd_relative = wpcap_lib_path };
-        mod.addObjectFile(wpcap_lib.path(b, "Packet.lib"));
-        mod.addObjectFile(wpcap_lib.path(b, "wpcap.lib"));
+        mod.addLibraryPath(wpcap_lib);
+        mod.linkSystemLibrary("Packet", .{
+            .preferred_link_mode = .static,
+            .needed = true,
+        });
+        mod.linkSystemLibrary("wpcap", .{
+            .preferred_link_mode = .static,
+            .needed = true,
+        });
     }
 
     const mod_tests = b.addTest(.{
