@@ -5,14 +5,7 @@ const Translator = @import("translate_c").Translator;
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const wpcap_lib_path = b.option(
-        []const u8,
-        "wpcap_lib_dir",
-        "Specify the dir to the wpcap static library artifact.",
-    ) orelse if (target.result.cpu.arch == .x86_64)
-        "vendor/wpcap/Lib/x64"
-    else
-        "vendor/wpcap/Lib";
+
     switch (target.result.os.tag) {
         .windows, .linux => {},
         else => return error.UnsupportedOs,
@@ -52,16 +45,7 @@ pub fn build(b: *std.Build) !void {
 
     // Building this library requires the wpcap bundled by SOEM
     if (target.result.os.tag == .windows) {
-        const wpcap_lib: std.Build.LazyPath = .{ .cwd_relative = wpcap_lib_path };
-        mod.addLibraryPath(wpcap_lib);
-        mod.linkSystemLibrary("Packet", .{
-            .preferred_link_mode = .static,
-            .needed = true,
-        });
-        mod.linkSystemLibrary("wpcap", .{
-            .preferred_link_mode = .static,
-            .needed = true,
-        });
+        mod.addLibraryPath(soem.namedLazyPath("wpcap_lib_dir"));
     }
 
     const mod_tests = b.addTest(.{
